@@ -21,7 +21,8 @@ load_dotenv()
 openai_org = os.getenv("OPENAI_ORG")
 if openai_org is not None:
     openai.organization = openai_org
-    logging.warning(f"Switching to organization: {openai_org} for OAI API key.")
+    logging.warning(
+        f"Switching to organization: {openai_org} for OAI API key.")
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 
@@ -41,9 +42,9 @@ class OpenAIDecodingArguments:
         suffix: The suffix to append to the end of the text.
         logprobs: The number of logprobs to return.
         echo: If True, echo back the prompt.
-    
+
     """
-    max_tokens: int = 1800
+    max_tokens: int = 500
     temperature: float = 0.2
     top_p: float = 1.0
     n: int = 1
