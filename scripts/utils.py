@@ -7,7 +7,8 @@ import math
 import os
 import sys
 import time
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence, Union, List, Dict
+import backoff
 
 import openai
 import tqdm
@@ -28,22 +29,6 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 
 @dataclasses.dataclass
 class OpenAIDecodingArguments:
-    """Decoding arguments for OpenAI API.
-
-    Args:
-        max_tokens: Maximum number of tokens to generate.
-        temperature: Temperature for sampling.
-        top_p: Top-p sampling.
-        n: Number of samples.
-        stream: If True, stream the result instead of returning it.
-        stop: The tokens to stop the generation if they are encountered.
-        presence_penalty: Presence penalty.
-        frequency_penalty: Frequency penalty.
-        suffix: The suffix to append to the end of the text.
-        logprobs: The number of logprobs to return.
-        echo: If True, echo back the prompt.
-
-    """
     max_tokens: int = 500
     temperature: float = 0.2
     top_p: float = 1.0
@@ -53,106 +38,70 @@ class OpenAIDecodingArguments:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     suffix: Optional[str] = None
-    logprobs: Optional[int] = None
-    echo: bool = False
+
+
+@backoff.on_exception(backoff.expo, openai.error.RateLimitError)
+def completions_with_backoff(**kwargs):
+    return openai_completion(**kwargs)
 
 
 def openai_completion(
-    prompts: Union[str, Sequence[str], Sequence[dict[str, str]], dict[str, str]],
+    messages: List[Dict[str, str]],
     decoding_args: OpenAIDecodingArguments,
-    model_name="text-davinci-003",
+    model_name="gpt-3.5-turbo",
     sleep_time=2,
-    batch_size=1,
-    max_instances=sys.maxsize,
-    max_batches=sys.maxsize,
     return_text=False,
     **decoding_kwargs,
-) -> Union[Union[StrOrOpenAIObject], Sequence[StrOrOpenAIObject], Sequence[Sequence[StrOrOpenAIObject]],]:
-    """Decode with OpenAI API.
-
-    Args:
-        prompts: A string or a list of strings to complete. If it is a chat model the strings should be formatted
-            as explained here: https://github.com/openai/openai-python/blob/main/chatml.md. If it is a chat model
-            it can also be a dictionary (or list thereof) as explained here:
-            https://github.com/openai/openai-cookbook/blob/main/examples/How_to_format_inputs_to_ChatGPT_models.ipynb
-        decoding_args: Decoding arguments.
-        model_name: Model name. Can be either in the format of "org/model" or just "model".
-        sleep_time: Time to sleep once the rate-limit is hit.
-        batch_size: Number of prompts to send in a single request. Only for non chat model.
-        max_instances: Maximum number of prompts to decode.
-        max_batches: Maximum number of batches to decode. This argument will be deprecated in the future.
-        return_text: If True, return text instead of full completion object (which contains things like logprob).
-        decoding_kwargs: Additional decoding arguments. Pass in `best_of` and `logit_bias` if you need them.
-
-    Returns:
-        A completion or a list of completions.
-        Depending on return_text, return_openai_object, and decoding_args.n, the completion type can be one of
-            - a string (if return_text is True)
-            - an openai_object.OpenAIObject object (if return_text is False)
-            - a list of objects of the above types (if decoding_args.n > 1)
-    """
-    is_single_prompt = isinstance(prompts, (str, dict))
-    if is_single_prompt:
-        prompts = [prompts]
-
-    if max_batches < sys.maxsize:
-        logging.warning(
-            "`max_batches` will be deprecated in the future, please use `max_instances` instead."
-            "Setting `max_instances` to `max_batches * batch_size` for now."
-        )
-        max_instances = max_batches * batch_size
-
-    prompts = prompts[:max_instances]
-    num_prompts = len(prompts)
-    prompt_batches = [
-        prompts[batch_id * batch_size: (batch_id + 1) * batch_size]
-        for batch_id in range(int(math.ceil(num_prompts / batch_size)))
-    ]
-
+) -> List[str]:
     completions = []
-    for batch_id, prompt_batch in tqdm.tqdm(
-        enumerate(prompt_batches),
-        desc="prompt_batches",
-        total=len(prompt_batches),
-    ):
-        batch_decoding_args = copy.deepcopy(
-            decoding_args)  # cloning the decoding_args
 
-        while True:
-            try:
-                shared_kwargs = dict(
-                    model=model_name,
-                    **batch_decoding_args.__dict__,
-                    **decoding_kwargs,
+    """"https://platform.openai.com/docs/api-reference/chat"""
+
+    # print current model
+    print("Current model: ", model_name)
+
+    while True:
+        try:
+            shared_kwargs = dict(
+                model=model_name,
+                temperature=decoding_args.temperature,
+                top_p=decoding_args.top_p,
+                n=decoding_args.n,
+                stream=decoding_args.stream,
+                stop=decoding_args.stop,
+                max_tokens=decoding_args.max_tokens,
+                presence_penalty=decoding_args.presence_penalty,
+                frequency_penalty=decoding_args.frequency_penalty,
+
+                **decoding_kwargs,
+            )
+            response = openai.ChatCompletion.create(
+                messages=messages, **shared_kwargs
+            )
+
+            if return_text:
+                completions = [choice['message']['content']
+                               for choice in response['choices']]
+            else:
+                completions = response['choices']
+
+            break
+        except openai.error.OpenAIError as e:
+            logging.warning(f"OpenAIError: {e}.")
+            if "Please reduce your prompt" in str(e):
+                decoding_args.max_tokens = int(decoding_args.max_tokens * 0.8)
+                logging.warning(
+                    f"Reducing target length to {decoding_args.max_tokens}, Retrying..."
                 )
-                completion_batch = openai.Completion.create(
-                    prompt=prompt_batch, **shared_kwargs)
-                choices = completion_batch.choices
+            else:
+                logging.warning("Hit request rate limit; retrying...")
+                time.sleep(sleep_time)
 
-                for choice in choices:
-                    choice["total_tokens"] = completion_batch.usage.total_tokens
-                completions.extend(choices)
-                break
-            except openai.error.OpenAIError as e:
-                logging.warning(f"OpenAIError: {e}.")
-                if "Please reduce your prompt" in str(e):
-                    batch_decoding_args.max_tokens = int(
-                        batch_decoding_args.max_tokens * 0.8)
-                    logging.warning(
-                        f"Reducing target length to {batch_decoding_args.max_tokens}, Retrying...")
-                else:
-                    logging.warning("Hit request rate limit; retrying...")
-                    time.sleep(sleep_time)  # Annoying rate limit on requests.
+    # Add the optional suffix if specified
+    if decoding_args.suffix:
+        completions = [completion +
+                       decoding_args.suffix for completion in completions]
 
-    if return_text:
-        completions = [completion.text for completion in completions]
-    if decoding_args.n > 1:
-        # make completions a nested list, where each entry is a consecutive decoding_args.n of original entries.
-        completions = [completions[i: i + decoding_args.n]
-                       for i in range(0, len(completions), decoding_args.n)]
-    if is_single_prompt:
-        # Return non-tuple if only 1 input and 1 generation.
-        (completions,) = completions
     return completions
 
 
@@ -183,7 +132,7 @@ def jdump(obj, f, mode="w", indent=4, default=str):
     """
     f = _make_w_io_base(f, mode)
     if isinstance(obj, (dict, list)):
-        json.dump(obj, f, indent=indent, default=default)
+        json.dump(obj, f, indent=indent, default=default, ensure_ascii=False)
     elif isinstance(obj, str):
         f.write(obj)
     else:
